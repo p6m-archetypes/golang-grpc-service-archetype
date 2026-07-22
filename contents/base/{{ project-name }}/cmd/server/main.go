@@ -14,13 +14,18 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
+
+	pb "{{ module_path }}/gen/{{ prefix_name }}_{{ suffix_name }}"
 	"{{ module_path }}/internal/config"
-{% if has_persistence and persistence == "PostgreSQL" %}	// "github.com/jackc/pgx/v5/pgxpool"
-{% endif %}{% if has_persistence and persistence == "MySQL" %}	// "database/sql"
-	// _ "github.com/go-sql-driver/mysql"
-{% endif %}{% if has_cache %}	// "github.com/redis/go-redis/v9"
-{% endif %}{% if messaging == "Kafka" %}	// "github.com/IBM/sarama"
-{% endif %}{% if messaging == "Pulsar" %}	// "github.com/apache/pulsar-client-go/pulsar"
+	"{{ module_path }}/internal/repository"
+	"{{ module_path }}/internal/service"
+	"{{ module_path }}/internal/telemetry"
+{% if has_persistence %}	"{{ module_path }}/internal/persistence"
+{% endif %}{% if has_cache %}	"{{ module_path }}/internal/cache"
+{% endif %}{% if has_messaging %}	"{{ module_path }}/internal/messaging"
 {% endif %}{% if has_s3 or has_azure_blob %}	"{{ module_path }}/internal/storage"
 {% endif %})
 
@@ -41,31 +46,30 @@ func main() {
 	logger := slog.New(logHandler)
 	slog.SetDefault(logger)
 
-{% if has_persistence and persistence == "PostgreSQL" %}	// pool, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
-	// if err != nil {
-	// 	slog.Error("db init failed", "error", err); os.Exit(1)
-	// }
-	// defer pool.Close()
+	// Traces: fail-open OTLP — exports iff OTEL_EXPORTER_OTLP_ENDPOINT is set
+	otelShutdown := telemetry.Init(context.Background(), "{{ project-name }}")
+	defer otelShutdown(context.Background())
 
-{% endif %}{% if has_persistence and persistence == "MySQL" %}	// db, err := sql.Open("mysql", cfg.DatabaseURL)
-	// if err != nil {
-	// 	slog.Error("db init failed", "error", err); os.Exit(1)
-	// }
-	// defer db.Close()
-
-{% endif %}{% if has_cache %}	// rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisURL})
-	// defer rdb.Close()
-
-{% endif %}{% if messaging == "Kafka" %}	// if err := messaging.Init(cfg.KafkaBrokers, cfg.KafkaUsername, cfg.KafkaPassword, cfg.KafkaSASLMechanism); err != nil {
-	// 	slog.Error("kafka init failed", "error", err); os.Exit(1)
-	// }
-	// defer messaging.Close()
-
-{% endif %}{% if messaging == "Pulsar" %}	// if err := messaging.Init(cfg.PulsarBrokerURL, cfg.PulsarTopic, cfg.PulsarJWTToken, cfg.PulsarSubscriptionName); err != nil {
-	// 	slog.Error("pulsar init failed", "error", err); os.Exit(1)
-	// }
-	// defer messaging.Close()
-
+{% if has_persistence %}	if err := persistence.Init(cfg.DatabaseURL); err != nil {
+		slog.Error("persistence init failed", "error", err)
+		os.Exit(1)
+	}
+	defer persistence.Close()
+{% endif %}{% if has_cache %}	if err := cache.Init(cfg.RedisURL); err != nil {
+		slog.Error("cache init failed", "error", err)
+		os.Exit(1)
+	}
+	defer cache.Close()
+{% endif %}{% if messaging == "Kafka" %}	if err := messaging.Init(cfg.KafkaBrokers, cfg.KafkaUsername, cfg.KafkaPassword, cfg.KafkaSASLMechanism); err != nil {
+		slog.Error("messaging init failed", "error", err)
+		os.Exit(1)
+	}
+	defer messaging.Close()
+{% elseif messaging == "Pulsar" %}	if err := messaging.Init(cfg.PulsarBrokerURL, cfg.PulsarTopic, cfg.PulsarJWTToken, cfg.PulsarSubscriptionName); err != nil {
+		slog.Error("messaging init failed", "error", err)
+		os.Exit(1)
+	}
+	defer messaging.Close()
 {% endif %}{% if has_s3 %}	if err := storage.InitS3(cfg.S3); err != nil {
 		slog.Error("storage s3 init failed", "error", err)
 		os.Exit(1)
@@ -75,9 +79,20 @@ func main() {
 		os.Exit(1)
 	}
 {% endif %}
+	store, err := repository.New(context.Background())
+	if err != nil {
+		slog.Error("repository init failed", "error", err)
+		os.Exit(1)
+	}
+
 	grpcSrv := grpc.NewServer()
-	// TODO: register {{ PrefixName }}{{ SuffixName }}Service after running 'make proto':
-	// pb.Register{{ PrefixName }}{{ SuffixName }}Server(grpcSrv, &service.{{ PrefixName }}{{ SuffixName }}Service{})
+	pb.Register{{ PrefixName }}{{ SuffixName }}Server(grpcSrv, service.New(store))
+
+	// Server reflection + grpc.health.v1 — the p6m platform contract for gRPC services.
+	reflection.Register(grpcSrv)
+	healthSrv := health.NewServer()
+	healthpb.RegisterHealthServer(grpcSrv, healthSrv)
+	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 
 	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.Host, cfg.Port))
 	if err != nil {
@@ -88,7 +103,21 @@ func main() {
 	mgmtMux := http.NewServeMux()
 	mgmtMux.HandleFunc("/health/readiness", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"status":"ok"}`)
+{% if persistence == "PostgreSQL" %}		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := persistence.DB().Ping(ctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintln(w, `{"status":"unavailable"}`)
+			return
+		}
+{% elseif persistence == "MySQL" %}		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := persistence.DB().PingContext(ctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintln(w, `{"status":"unavailable"}`)
+			return
+		}
+{% endif %}		fmt.Fprintln(w, `{"status":"ok"}`)
 	})
 	mgmtMux.HandleFunc("/health/liveness", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -121,6 +150,7 @@ func main() {
 	<-ctx.Done()
 	slog.Info("shutting down...")
 
+	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
 	grpcSrv.GracefulStop()
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

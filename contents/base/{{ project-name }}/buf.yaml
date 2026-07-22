@@ -4,6 +4,12 @@ modules:
 lint:
   use:
     - STANDARD
+  except:
+    # The p6m contract (DECIDED 2026-07-22) uses a flat, unversioned package and
+    # entity-named responses; see prova-p6m-standards/docs/standards.md S2.
+    - PACKAGE_VERSION_SUFFIX
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - RPC_RESPONSE_STANDARD_NAME
 breaking:
   use:
     - FILE
