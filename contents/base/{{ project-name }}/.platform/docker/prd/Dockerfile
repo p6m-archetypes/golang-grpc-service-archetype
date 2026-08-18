@@ -14,7 +14,7 @@ COPY . .
 RUN mkdir -p gen && protoc -I proto \
     --go_out=gen --go_opt=paths=source_relative \
     --go-grpc_out=gen --go-grpc_opt=paths=source_relative \
-    proto/{{ prefix_name }}_{{ suffix_name }}/{{ prefix_name }}_{{ suffix_name }}.proto
+    proto/{{ project_name }}/{{ project_name }}.proto
 RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o server ./cmd/server
 

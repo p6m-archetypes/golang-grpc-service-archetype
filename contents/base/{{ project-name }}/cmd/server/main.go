@@ -18,7 +18,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
-	pb "{{ module_path }}/gen/{{ prefix_name }}_{{ suffix_name }}"
+	pb "{{ module_path }}/gen/{{ project_name }}"
 {% if has_cache %}
 	"{{ module_path }}/internal/cache"
 {% endif %}
@@ -104,7 +104,7 @@ func main() {
 	}
 
 	grpcSrv := grpc.NewServer()
-	pb.Register{{ PrefixName }}{{ SuffixName }}Server(grpcSrv, service.New(store))
+	pb.Register{{ ProjectName }}Server(grpcSrv, service.New(store))
 
 	// Server reflection + grpc.health.v1 — the p6m platform contract for gRPC services.
 	reflection.Register(grpcSrv)
